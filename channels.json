@@ -1,0 +1,155 @@
+[
+  {
+    "name": "#general",
+    "type": "public",
+    "permissions": {
+      "canReact": true,
+      "canDelete": true,
+      "canEdit": true,
+      "canSeeMessageHistory": true,
+      "canSendMessages": true,
+      "canSendMessagesWithAttachments": true,
+      "maxMessageLength": 500,
+      "rateLimitType": "slowmode",
+      "slowmode": 5,
+      "rateLimitCount": 5,
+      "rateLimitPeriod": 5000
+    }
+  },
+  {
+    "name": "#taiko",
+    "type": "public",
+    "permissions": {
+      "canReact": true,
+      "canDelete": true,
+      "canEdit": true,
+      "canSeeMessageHistory": true,
+      "canSendMessages": true,
+      "canSendMessagesWithAttachments": true,
+      "maxMessageLength": 500,
+      "rateLimitType": "none",
+      "slowmode": 0,
+      "rateLimitCount": 0,
+      "rateLimitPeriod": 0
+    }
+  },
+  {
+    "name": "#feedback",
+    "type": "public",
+    "permissions": {
+      "canReact": true,
+      "canDelete": true,
+      "canEdit": false,
+      "canSeeMessageHistory": true,
+      "canSendMessages": true,
+      "canSendMessagesWithAttachments": false,
+      "rateLimitType": "slowmode",
+      "maxMessageLength": 500,
+      "slowmode": 30,
+      "rateLimitCount": 0,
+      "rateLimitPeriod": 0
+    }
+  },
+  {
+    "name": "#announcements",
+    "type": "public",
+    "permissions": {
+      "canReact": true,
+      "canDelete": false,
+      "canEdit": false,
+      "canSeeMessageHistory": true,
+      "canSendMessages": false,
+      "canSendMessagesWithAttachments": false,
+      "rateLimitType": "none",
+      "maxMessageLength": null,
+      "slowmode": 0,
+      "rateLimitCount": 0,
+      "rateLimitPeriod": 0
+    }
+  },
+  {
+    "name": "#all-scores",
+    "type": "public",
+    "permissions": {
+      "canReact": true,
+      "canDelete": false,
+      "canEdit": false,
+      "canSeeMessageHistory": true,
+      "canSendMessages": false,
+      "canSendMessagesWithAttachments": false,
+      "maxMessageLength": null,
+      "rateLimitType": "none",
+      "slowmode": 0,
+      "rateLimitCount": 0,
+      "rateLimitPeriod": 0
+    }
+  },
+  {
+    "name": "tvm1",
+    "type": "public",
+    "permissions": {
+      "canReact": true,
+      "canDelete": true,
+      "canEdit": true,
+      "canSeeMessageHistory": true,
+      "maxMessageLength": 125,
+      "canSendMessages": true,
+      "canSendMessagesWithAttachments": true,
+      "rateLimitType": "rateLimit",
+      "slowmode": 0,
+      "rateLimitCount": 5,
+      "rateLimitPeriod": 7500
+    }
+  },
+  {
+    "name": "tvm2",
+    "type": "public",
+    "permissions": {
+      "canReact": true,
+      "canDelete": true,
+      "canEdit": true,
+      "canSeeMessageHistory": true,
+      "maxMessageLength": 125,
+      "canSendMessages": true,
+      "canSendMessagesWithAttachments": true,
+      "rateLimitType": "rateLimit",
+      "slowmode": 0,
+      "rateLimitCount": 5,
+      "rateLimitPeriod": 7500
+    }
+  },
+  {
+    "name": "dm_default",
+    "type": "public",
+    "permissions": {
+      "canReact": true,
+      "canDelete": true,
+      "canEdit": true,
+      "canSeeMessageHistory": true,
+      "canSendMessages": true,
+      "maxMessageLength": null,
+      "canSendMessagesWithAttachments": true,
+      "rateLimitType": "none",
+      "slowmode": 0,
+      "rateLimitCount": 0,
+      "rateLimitPeriod": 0
+    }
+  },
+  {
+    "name": "penischannel123",
+    "type": "public",
+    "permissions": {
+      "canReact": true,
+      "canDelete": true,
+      "canEdit": true,
+      "canSeeMessageHistory": true,
+      "canSendMessages": true,
+      "maxMessageLength": null,
+      "canSendMessagesWithAttachments": true,
+      "rateLimitType": "rateLimit",
+      "slowmode": 0,
+      "rateLimitCount": 5,
+      "rateLimitPeriod": 7500
+    }
+  }
+]
