@@ -146,11 +146,15 @@ app.get('/', async (req,res)=>{
             ...user,
             publicid: uuid.v4(),
             roles: [],
+            inbox: [],
             registeredAt: (new Date()).toISOString(),
             creationIp: req.ip
         }
         users.push(userInUsers);
     }
+
+    if (!req.headers.upgrade)
+        return res.status(200).json({"Success":true,"data":"All set! You can reconnect with a websocket connection."})
 
     return websocket.handleUpgrade(req,req.socket,"",(ws)=>{
         ws.user = { ...user, publicid: userInUsers.publicid }
@@ -159,20 +163,24 @@ app.get('/', async (req,res)=>{
 })
 
 app.get('/register',(req,res)=>{
-    const uuid = uuid.v4()
-    validGuestUuids.add(uuid)
-    res.cookie('guestAccountUuid',uuid,{
+    const acuuid = uuid.v4()
+    validGuestUuids.add(acuuid)
+    res.cookie('guestAccountUuid',acuuid,{
         httpOnly: true,
         sameSite: "strict",
-        maxAge: new Date('9999-12-31')
+        expires: new Date('9999-12-31')
     })
-    res.status(200).json({"uuid": uuid})
+    res.status(200).json({"success":true,"uuid": acuuid})
 })
 
 websocket.on("connection",(ws)=>{
     ws.onmessage = (ev) => {
         try {
+            if (ev.data.length > 65535)
+                return ws.terminate()
             let json = JSON.parse(ev.data)
+            if (ev.data.length > 4096)
+                return ws.send(JSON.stringify({msgid:json.msgid, type:"error", error: "Too much data" }))
             onMessage(json,ws)
         } catch (e) {
             console.error(e)
@@ -184,14 +192,13 @@ function onMessage(msg,ws) {
     const { msgid } = msg;
     const { username, isGuest, privateid, publicid } = ws.user;
 
-    const userIsAdmin = ((user)=>{
+    userpermissions = ((user)=>{
         const fulluser = users.find(u => u.privateid === user.privateid)
         if (!fulluser) return false;
-        let hasroles = [];
-        fulluser.roles.forEach(id=>{
-            hasroles.push(roles.find(role=>role.name === id))
-        })
-        return hasroles.some(role=>role.isAdmin)
+        return fulluser.roles
+               .map(name=>roles.find(role=>role.name === name))
+               .sort((a,b)=>a.level-b.level)
+               ?.[0].permissions
     })(ws.user)
 
     switch (msg.type) {
@@ -216,7 +223,7 @@ function onMessage(msg,ws) {
             ws.send(JSON.stringify({ msgid: msgid, type: 'chat_history', data: processChatMessagesForPublicViewing(historyToSend) }));
         } break;
         case "send_message": {
-            const { attachment, channel, xss, tvmGuestAccountKey, additionalDetails} = msg.data;
+            const { attachment, channel, xss, additionalDetails} = msg.data;
             let { message } = msg.data;
 
             const permissions = getChannelPermissions(channel);
@@ -228,19 +235,15 @@ function onMessage(msg,ws) {
             const canSendMessages = permissions.canSendMessages
             const canSendMessagesWithAttachments = permissions.canSendMessagesWithAttachments;
 
-            if (!canSendMessages && !userIsAdmin)
+            if (!canSendMessages && !userpermissions.administrator)
                 return ws.send(JSON.stringify({ msgid: msgid, type: "error", error: "You can't send messages in this channel"}));
-            if (attachment && !canSendMessagesWithAttachments && !userIsAdmin)
+            if (attachment && !canSendMessagesWithAttachments && !userpermissions.administrator)
                 return ws.send(JSON.stringify({ msgid: msgid, type: "error", error: "You can't send messages with attachments in this channel"}));
 
-            if (maxMessageLength && message.length > maxMessageLength && !userIsAdmin)
+            if (maxMessageLength && message.length > maxMessageLength && !userpermissions.administrator)
                 message = message.substring(0,maxMessageLength);
 
-            const sanitizedMessage = xss && userIsAdmin ? message : sanitize(message);
-
-            if (!userIsAdmin) {
-                // The rate limiting  would go here
-            }
+            const sanitizedMessage = xss && userpermissions.canXSS ? message : sanitize(message);
 
             const chatMsg = {
                 id: uuid.v4(),
@@ -262,6 +265,47 @@ function onMessage(msg,ws) {
             // The mention sending logic would go here
 
             ws.send(JSON.stringify({msgid:msgid,type:"ok"}))
+        } break;
+        case "get_older_messages": {
+            const { lastMsgId, limit: numMessages = 100 } = msg.data;
+
+            if (numMessages > 100)
+                return ws.send(JSON.stringify({ msgid:msgid, type: "error", error: "Too many messages requested" }))
+
+            if (!getChannelPermissions(ws.channel).canSeeMessageHistory && !userpermissions.administrator)
+                return ws.send(JSON.stringify({ msgid:msgid, type: "older_messages", data: [] }))
+
+            const index = messages.filter(m => m.channel === ws.channel).findIndex(m => m.id === lastMsgId);
+            const olderMessages = messages.slice(Math.max(0, index - numMessages), index);
+
+            ws.send(JSON.stringify({ 
+                msgid:msgid, 
+                type: 'older_messages', 
+                data: processChatMessagesForPublicViewing(olderMessages) 
+            }));
+        } break;
+        case "get_surrounding_messages": {
+            const { messageId, limit = 25 } = msg.data;
+
+            if (!getChannelPermissions(ws.channel).canSeeMessageHistory && !userpermissions.administrator)
+                return ws.send(JSON.stringify({ msgid:msgid, type: 'surrounding_messages', data: { messages: [], hasMoreNewer: false } }));
+
+            const channelMessages = messages.filter(m => m.channel === ws.channel);
+            const targetIndex = channelMessages.findIndex(m => m.id === messageId);
+
+            if (targetIndex === -1)
+                return ws.send(JSON.stringify({ msgid:msgid, type: 'surrounding_messages', data: { messages: [], hasMoreNewer: false } }));
+            
+            const endIndex = Math.min(channelMessages.length, targetIndex + 1 + limit);
+            const combinedMessages = channelMessages.slice(Math.max(0, targetIndex - limit), endIndex);
+
+            ws.send(JSON.stringify({
+                msgid:msgid, type: 'surrounding_messages',
+                data: {
+                    messages: processChatMessagesForPublicViewing(combinedMessages),
+                    hasMoreNewer: endIndex < channelMessages.length
+                }
+            }));
         } break;
         default:
             break;
