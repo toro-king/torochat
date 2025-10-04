@@ -60,6 +60,18 @@ try {
     console.warn("Error loading roles, starting fresh");
 }
 
+let rateLimits = [];
+const genericRateLimits = {
+    "change_channel": "6/2",
+    "send_message": "10/5",
+    "get_older_messages": "15/4",
+    "get_surrounding_messages": "15/4",
+
+}
+
+let activeUsers = [];
+let typingUsers = {}
+
 function getChannelPermissions(chan) {
     return channels.find(cha=>cha.name === chan)?.permissions
 }
@@ -79,6 +91,27 @@ function sanitize(str) {
     .replace(/'/g, "&#39;")
 }
 
+function sendUsersOnline() {
+    const now = Date.now()
+    activeUsers = activeUsers.map(u=>{
+        const idleMs = now - u.lastUpdate
+        if (idleMs > 60 * 1000)
+            u.status = 2
+        return u
+    })
+    const safeUsersForBroadcast = activeUsers.map(u=>{return {
+        username: u.username,
+        isGuest: u.isGuest,
+        status: u.status,
+        publicid: u.publicid
+    }})
+    sendForAllConnectedUsers({type: "online_users", data: safeUsersForBroadcast})
+}
+
+function sendTypingUsers() {
+    
+}
+
 function processChatMessagesForPublicViewing(chatMsgs) {
     let msgs = [];
     if (!Array.isArray(chatMsgs)) chatMsgs = [chatMsgs]
@@ -86,18 +119,20 @@ function processChatMessagesForPublicViewing(chatMsgs) {
         const { username, loggedIn, publicid } = users.find(u=>u.privateid === chatMsg.by)
         msgs.push({
             ...chatMsg,
-            by: undefined,
+            by: publicid,
             username: username,
-            isGuest: !loggedIn,
-            publicid: publicid
+            isGuest: !loggedIn
         })
     })
     return msgs.length === 1 ? msgs[0] : msgs
 }
 
-function sendForAllConnectedUsers(data, channel) {
+async function sendForAllConnectedUsers(data, channel) {
     const clients = channel ? Array.from(websocket.clients).filter(a=>a.channel === channel) : Array.from(websocket.clients);
-    clients.forEach(ws=>ws.send(JSON.stringify(data)))
+    clients.forEach(ws=>{
+        if (ws.readyState === 1)
+            ws.send(JSON.stringify(data))
+    })
 }
 
 app.get('/', async (req,res)=>{
@@ -174,17 +209,58 @@ app.get('/register',(req,res)=>{
 })
 
 websocket.on("connection",(ws)=>{
+    const { username, isGuest, privateid, publicid } = ws.user
+    activeUsers.push({
+        username: username,
+        isGuest: isGuest,
+        privateid: privateid,
+        publicid: publicid,
+        status: 1,
+        lastUpdate: Date.now()
+    })
+    console.log(username + (isGuest ? " \x1b[90m(guest)\x1b[0m" : " ") + "has connected.")
+    sendUsersOnline()
+
     ws.onmessage = (ev) => {
-        try {
-            if (ev.data.length > 65535)
-                return ws.terminate()
-            let json = JSON.parse(ev.data)
-            if (ev.data.length > 4096)
-                return ws.send(JSON.stringify({msgid:json.msgid, type:"error", error: "Too much data" }))
-            onMessage(json,ws)
-        } catch (e) {
-            console.error(e)
+        if (ev.data.length > 32767)
+            return ws.terminate()
+
+        try { var json = JSON.parse(ev.data) }
+        catch (e) { 
+            console.warn(e); 
+            return ws.send(JSON.stringify({type:"error", error: "Invalid JSON" })); 
         }
+
+        const type = json.type;
+        if (!genericRateLimits[type])
+            return ws.send(JSON.stringify({msgid:json.msgid, type:"error", error: "Unknown type" })); 
+        const [ rateLimitAmount, rateLimitSecs ] = genericRateLimits[type].split('/')
+
+        let rateLimitWs = rateLimits.find(r=> r.privateid === privateid && r.route === type)
+        if (rateLimitWs?.count >= rateLimitAmount)
+            return ws.send(JSON.stringify({msgid:json.msgid, type:"error", error: "Too many requests" }));
+        if (!rateLimitWs) {
+            rateLimitWs = {
+                privateid: privateid,
+                route: type,
+                count: 0
+            }
+            rateLimits.push(rateLimitWs)
+            setTimeout(()=>{
+                rateLimits.splice(rateLimits.findIndex(r=>r.privateid=== privateid && r.route===type),1)
+            }, Number(rateLimitSecs)*1000)
+        }
+        rateLimitWs.count++;
+
+        if (ev.data.length > 4096)
+            return ws.send(JSON.stringify({msgid:json.msgid, type:"error", error: "Too much data" }))
+
+        onMessage(json,ws)
+    }
+    
+    ws.onclose = (code) => {
+        activeUsers.splice(activeUsers.findIndex(u=>u.privateid === privateid),1)
+        console.log(username + (isGuest ? " \x1b[90m(guest)\x1b[0m" : " ") + "has disconnected. Reason: " + code.reason)
     }
 })
 
@@ -192,18 +268,15 @@ function onMessage(msg,ws) {
     const { msgid } = msg;
     const { username, isGuest, privateid, publicid } = ws.user;
 
-    userpermissions = ((user)=>{
-        const fulluser = users.find(u => u.privateid === user.privateid)
-        if (!fulluser) return false;
-        return fulluser.roles
-               .map(name=>roles.find(role=>role.name === name))
-               .sort((a,b)=>a.level-b.level)
-               ?.[0].permissions
-    })(ws.user)
+    userpermissions = users
+                      .find(u => u.privateid === privateid).roles
+                      .map(name=>roles.find(role=>role.name === name))
+                      .sort((a,b)=>a.level-b.level)
+                      ?.[0].permissions
 
     switch (msg.type) {
         case "change_channel": {
-            const { newChannel, getHistory } = msg.data
+            const { newChannel } = msg.data
 
             const channel = channels.find(a=>a.name===newChannel)
 
@@ -215,12 +288,93 @@ function onMessage(msg,ws) {
             const permissions = getChannelPermissions(newChannel);
             ws.send(JSON.stringify({ msgid: msgid, type: "channel_permissions", data: permissions }))
 
-            if (getHistory === false) return;
-
             let historyToSend = [];
             if (permissions.canSeeMessageHistory === true) 
                 historyToSend = messages.filter(m => m.channel === newChannel).slice(-50);
             ws.send(JSON.stringify({ msgid: msgid, type: 'chat_history', data: processChatMessagesForPublicViewing(historyToSend) }));
+        } break;
+        case "get_older_messages":
+        case "get_newer_messages": {
+            const { lastMsgId, limit: numMessages = 100 } = msg.data;
+            if (!lastMsgId || typeof(lastMsgId) !== "string")
+                return ws.send(JSON.stringify({ msgid:msgid, type: "error", error: "Please provide lastMsgId" }))
+            const type = msg.type.slice(4)
+
+            if (numMessages > 100)
+                return ws.send(JSON.stringify({ msgid:msgid, type: "error", error: "Too many messages requested" }))
+
+            if (!getChannelPermissions(ws.channel).canSeeMessageHistory && !userpermissions.administrator)
+                return ws.send(JSON.stringify({ msgid:msgid, type: type, data: [] }))
+
+            const index = messages.filter(m => m.channel === ws.channel).findIndex(m => m.id === lastMsgId);
+            const foundMessages = type === "older_messages"
+                             ? messages.slice(Math.max(0, index - numMessages), index)
+                             : messages.slice(index + 1, index + 1 + numMessages);
+
+            ws.send(JSON.stringify({ 
+                msgid:msgid, 
+                type: type, 
+                data: processChatMessagesForPublicViewing(foundMessages) 
+            }));
+        } break;
+        case "get_surrounding_messages": {
+            const { messageId, limit = 25 } = msg.data;
+            if (!messageId || typeof(messageId) !== "string")
+                return ws.send(JSON.stringify({ msgid:msgid, type: "error", error: "Please provide messageId" }))
+
+            if (!getChannelPermissions(ws.channel).canSeeMessageHistory && !userpermissions.administrator)
+                return ws.send(JSON.stringify({ msgid:msgid, type: 'surrounding_messages', data: { messages: [], hasMoreNewer: false } }));
+
+            const channelMessages = messages.filter(m => m.channel === ws.channel);
+            const targetIndex = channelMessages.findIndex(m => m.id === messageId);
+
+            if (targetIndex === -1)
+                return ws.send(JSON.stringify({ msgid:msgid, type: 'surrounding_messages', data: { messages: [], hasMoreNewer: false } }));
+            
+            const endIndex = Math.min(channelMessages.length, targetIndex + 1 + limit);
+            const combinedMessages = channelMessages.slice(Math.max(0, targetIndex - limit), endIndex);
+
+            ws.send(JSON.stringify({
+                msgid:msgid, type: 'surrounding_messages',
+                data: {
+                    messages: processChatMessagesForPublicViewing(combinedMessages),
+                    hasMoreNewer: endIndex < channelMessages.length
+                }
+            }));
+        } break;
+        case "get_message_by_id": {
+            const { messageId } = msg.data;
+            if (!messageId || typeof(messageId) !== "string")
+                return ws.send(JSON.stringify({ msgid:msgid, type: "error", error: "Please provide messageId" }))
+
+            const targetMessage = messages.find(m => m.id === messageId);
+            if (!targetMessage)
+                return ws.send(JSON.stringify({ msgid:msgid, type: "error", error: "Message not found with that id" }))
+            if (targetMessage.deleted)
+                return ws.send(JSON.stringify({ msgid:msgid, type: "error", error: "That message is deleted" }))
+
+            const targetMessageChannel = targetMessage.channel;
+            if (!userpermissions.administrator && 
+               (!getChannelPermissions(targetMessageChannel).canSeeMessageHistory || !userCanSeeChannel(targetMessageChannel, ws.user)))
+                return ws.send(JSON.stringify({ msgid:msgid, type: "error", error: "You don't have permission to view this message" }))
+
+            ws.send(JSON.stringify({ msgid:msgid, type: "message_by_id", data: processChatMessagesForPublicViewing(targetMessage) }))
+        } break;
+
+        // What once was HTTP, now fully Websocket
+        case "update_status": {
+            // This now simply updates a user's status rather than a bunch of other shite
+            let { status } = msg.data;
+            if (typeof(status) !== "number")
+                return ws.send(JSON.stringify({msgid:msgid, type: "error", error: "Must be a valid number"}))
+            status = Math.round(status)
+            if (status < 1 || status > 2)
+                return ws.send(JSON.stringify({msgid:msgid, type: "error", error: "Must be a valid number"}))
+
+            const user = activeUsers[activeUsers.findIndex(u=>u.privateid === privateid)]
+            user.status = status;
+            user.lastUpdate = Date.now();
+            ws.send(JSON.stringify({msgid:msgid, type: "ok"}))
         } break;
         case "send_message": {
             const { attachment, channel, xss, additionalDetails} = msg.data;
@@ -266,47 +420,6 @@ function onMessage(msg,ws) {
 
             ws.send(JSON.stringify({msgid:msgid,type:"ok"}))
         } break;
-        case "get_older_messages": {
-            const { lastMsgId, limit: numMessages = 100 } = msg.data;
-
-            if (numMessages > 100)
-                return ws.send(JSON.stringify({ msgid:msgid, type: "error", error: "Too many messages requested" }))
-
-            if (!getChannelPermissions(ws.channel).canSeeMessageHistory && !userpermissions.administrator)
-                return ws.send(JSON.stringify({ msgid:msgid, type: "older_messages", data: [] }))
-
-            const index = messages.filter(m => m.channel === ws.channel).findIndex(m => m.id === lastMsgId);
-            const olderMessages = messages.slice(Math.max(0, index - numMessages), index);
-
-            ws.send(JSON.stringify({ 
-                msgid:msgid, 
-                type: 'older_messages', 
-                data: processChatMessagesForPublicViewing(olderMessages) 
-            }));
-        } break;
-        case "get_surrounding_messages": {
-            const { messageId, limit = 25 } = msg.data;
-
-            if (!getChannelPermissions(ws.channel).canSeeMessageHistory && !userpermissions.administrator)
-                return ws.send(JSON.stringify({ msgid:msgid, type: 'surrounding_messages', data: { messages: [], hasMoreNewer: false } }));
-
-            const channelMessages = messages.filter(m => m.channel === ws.channel);
-            const targetIndex = channelMessages.findIndex(m => m.id === messageId);
-
-            if (targetIndex === -1)
-                return ws.send(JSON.stringify({ msgid:msgid, type: 'surrounding_messages', data: { messages: [], hasMoreNewer: false } }));
-            
-            const endIndex = Math.min(channelMessages.length, targetIndex + 1 + limit);
-            const combinedMessages = channelMessages.slice(Math.max(0, targetIndex - limit), endIndex);
-
-            ws.send(JSON.stringify({
-                msgid:msgid, type: 'surrounding_messages',
-                data: {
-                    messages: processChatMessagesForPublicViewing(combinedMessages),
-                    hasMoreNewer: endIndex < channelMessages.length
-                }
-            }));
-        } break;
         default:
             break;
     }
@@ -337,3 +450,5 @@ boi.forEach(thing=>{
 })
 
 app.listen(12345)
+
+setInterval(sendUsersOnline,10000)
