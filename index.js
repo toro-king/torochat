@@ -70,7 +70,7 @@ const genericRateLimits = {
 }
 
 let activeUsers = [];
-let typingUsers = {}
+let typingUsers = []
 
 function getChannelPermissions(chan) {
     return channels.find(cha=>cha.name === chan)?.permissions
@@ -109,7 +109,22 @@ function sendUsersOnline() {
 }
 
 function sendTypingUsers() {
-    
+    const typingByChannel = {};
+    typingUsers.forEach(t => {
+        if (!typingByChannel[t.channel]) typingByChannel[t.channel] = [];
+        typingByChannel[t.channel].push(t.publicid);
+    });
+
+    Object.entries(typingByChannel).forEach(([channel, pids]) => {
+        sendForAllConnectedUsers({ type: "typing_users", data: pids }, channel);
+    });
+}
+
+function channelsVisibleForUser(user) {
+    return channels.filter(c=>{
+        if (c.type === "public" || c.type === "private" && c.members.includes(user.privateid)) return true;
+        return false;
+    }).map(c=>c.name)
 }
 
 function processChatMessagesForPublicViewing(chatMsgs) {
@@ -182,8 +197,10 @@ app.get('/', async (req,res)=>{
             publicid: uuid.v4(),
             roles: [],
             inbox: [],
-            registeredAt: (new Date()).toISOString(),
-            creationIp: req.ip
+            unreadChannels: [],
+            registeredAt: Date.now(),
+            creationIp: req.ip,
+            activity: []
         }
         users.push(userInUsers);
     }
@@ -193,6 +210,7 @@ app.get('/', async (req,res)=>{
 
     return websocket.handleUpgrade(req,req.socket,"",(ws)=>{
         ws.user = { ...user, publicid: userInUsers.publicid }
+        ws.channel = "#general"
         websocket.emit('connection',ws)
     })
 })
@@ -220,6 +238,31 @@ websocket.on("connection",(ws)=>{
     })
     console.log(username + (isGuest ? " \x1b[90m(guest)\x1b[0m" : " ") + "has connected.")
     sendUsersOnline()
+
+    let userInUsers = users.find(u=>u.privateid === privateid)
+    userInUsers.activity.push({
+        type: "connect",
+        data: null,
+        ts: Date.now()
+    })
+    const userLastDisconnectTs = userInUsers.activity
+                                 .filter(a=>a.type==="disconnect")
+                                 .at(-1)
+                                 .ts
+
+    channelsVisibleForUser(ws.user).forEach(c=>{
+        const messageAfterLeaveTs = messages.filter(m=>m.channel===c)
+                                  .find(m=>m.timestamp > userLastDisconnectTs)
+                                  ?.timestamp
+        if (messageAfterLeaveTs && userInUsers.unreadChannels.findIndex(c2=>c2.channel === c) === -1) 
+            userInUsers.unreadChannels.push({
+                channel: c,
+                unreadSince: messageAfterLeaveTs
+            })
+    })
+
+    ws.send(JSON.stringify({ type:"unreadDms", data:userInUsers.unreadChannels }))
+    ws.send(JSON.stringify({ type:"inbox", data:processChatMessagesForPublicViewing(messages.filter(msg=>userInUsers.inbox.includes(msg.id))) }))
 
     ws.onmessage = (ev) => {
         if (ev.data.length > 32767)
@@ -261,6 +304,12 @@ websocket.on("connection",(ws)=>{
     ws.onclose = (code) => {
         activeUsers.splice(activeUsers.findIndex(u=>u.privateid === privateid),1)
         console.log(username + (isGuest ? " \x1b[90m(guest)\x1b[0m" : " ") + "has disconnected. Reason: " + code.reason)
+
+        userInUsers.activity.push({
+            type: "disconnect",
+            data: null,
+            ts: Date.now()
+        })
     }
 })
 
@@ -268,11 +317,12 @@ function onMessage(msg,ws) {
     const { msgid } = msg;
     const { username, isGuest, privateid, publicid } = ws.user;
 
-    userpermissions = users
+    const userpermissions = users
                       .find(u => u.privateid === privateid).roles
                       .map(name=>roles.find(role=>role.name === name))
                       .sort((a,b)=>a.level-b.level)
                       ?.[0].permissions
+    const userInUsers = users.find(u=>u.privateid === privateid)
 
     switch (msg.type) {
         case "change_channel": {
@@ -284,6 +334,10 @@ function onMessage(msg,ws) {
                 return ws.send(JSON.stringify({msgid:msgid, type: "error", error: "This channel does not exist"}));
 
             ws.channel = newChannel
+
+            const uindex = userInUsers.unreadChannels.findIndex(c=>c.channel===newChannel)
+            if (uindex !== -1)
+                userInUsers.unreadChannels.splice(uindex, 1)
 
             const permissions = getChannelPermissions(newChannel);
             ws.send(JSON.stringify({ msgid: msgid, type: "channel_permissions", data: permissions }))
@@ -377,8 +431,9 @@ function onMessage(msg,ws) {
             ws.send(JSON.stringify({msgid:msgid, type: "ok"}))
         } break;
         case "send_message": {
-            const { attachment, channel, xss, additionalDetails} = msg.data;
+            const { attachment, xss, additionalDetails} = msg.data;
             let { message } = msg.data;
+            const channel = ws.channel
 
             const permissions = getChannelPermissions(channel);
 
@@ -405,20 +460,71 @@ function onMessage(msg,ws) {
                 message: sanitizedMessage,
                 attachment: attachment,
                 additionalDetails: additionalDetails,
-                timestamp: (new Date()).toISOString(),
+                timestamp: Date.now(),
                 channel: channel
             }
 
             messages.push(chatMsg)
             sendForAllConnectedUsers({type: "chat_message", data: processChatMessagesForPublicViewing(chatMsg)}, channel)
 
-            // The inbox logic would go here
+            websocket.clients.forEach(ws=>{
+                const userInUsers = users.find(u=>u.privateid === ws.user.privateid)
+                if (ws.channel !== channel && userInUsers.unreadChannels.findIndex(c=>c.channel === channel) === -1) {
+                    userInUsers.unreadChannels.push({
+                        channel: channel,
+                        unreadSince: Date.now()
+                    })
+                    ws.send(JSON.stringify({type: "unread_message",data: channel}))
+                }
+            })
 
-            sendForAllConnectedUsers({type: "unread_message", data: { channel: channel }}) // TODO: Adjust so it doesnt send every single time
-
-            // The mention sending logic would go here
+            const mentions = chatMsg.additionalDetails?.mentions
+            if (mentions)
+                mentions.forEach(m=>{
+                    const userInUsers = users.find(u=>u.publicid === m.publicid)
+                    if (userInUsers) {
+                        userInUsers.inbox.push(chatMsg.id)
+                        const wstarget = websocket.clients.find(ws2=>ws2.user.publicid === m.publicid)
+                        if (wstarget && wstarget.channel !== channel)
+                            wstarget.send(JSON.stringify({type: "mentions", data: processChatMessagesForPublicViewing(chatMsg)}))
+                    }
+                })
 
             ws.send(JSON.stringify({msgid:msgid,type:"ok"}))
+        } break;
+        case "typing": {
+            const { status } = msg.data;
+            if (typeof(status) !== 'number')
+                return ws.send(JSON.stringify({msgid:msgid, type: "error", error: "Must be number"}));
+           
+            const permissions = getChannelPermissions(ws.channel);
+            if (!permissions.canSendMessages)
+                return ws.send(JSON.stringify({msgid:msgid, type: "error", error: "Can't send messages here"}));
+
+            const index = typingUsers.findIndex(t=>t.publicid === publicid);
+
+            if (status === 1) {
+                let timeout = setTimeout(()=>{
+                    typingUsers.splice(typingUsers.findIndex(t=>t.publicid === publicid),1)
+                    sendTypingUsers();
+                },10000)
+                let typingObj = {
+                    publicid: publicid,
+                    channel: ws.channel,
+                    timeout: timeout
+                }
+                if (index !== -1) {
+                    clearTimeout(typingUsers[index].timeout)
+                    typingUsers[index] = typingObj
+                }
+                else typingUsers.push(typingObj)
+            } else if (status === 0 && index !== -1) {
+                clearTimeout(typingUsers[index].timeout)
+                typingUsers.splice(index, 1)
+            }
+
+            sendTypingUsers();
+            ws.send(JSON.stringify({msgid:msgid, type: "ok"}));
         } break;
         default:
             break;
