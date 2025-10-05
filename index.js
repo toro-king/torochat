@@ -44,10 +44,7 @@ try {
                 "canSendMessages": true,
                 "canSendMessagesWithAttachments": true,
                 "maxMessageLength": 500,
-                "rateLimitType": "slowmode",
-                "slowmode": 5,
-                "rateLimitCount": 5,
-                "rateLimitPeriod": 5000
+                "slowmode": 0,
             }
         }
     ]
@@ -63,10 +60,16 @@ try {
 let rateLimits = [];
 const genericRateLimits = {
     "change_channel": "6/2",
-    "send_message": "10/5",
     "get_older_messages": "15/4",
+    "get_newer_messages": "15/4",
     "get_surrounding_messages": "15/4",
-
+    "get_message_by_id": "15/4",
+    "update_status": "3/15",
+    "send_message": "10/5",
+    "typing": "15/3",
+    "delete_message": "15/5",
+    "change_username": "3/20",
+    "create_dm": "5/60"
 }
 
 let activeUsers = [];
@@ -77,9 +80,14 @@ function getChannelPermissions(chan) {
 }
 
 function userCanSeeChannel(channel, user) {
-    if (!channel) return false;
+    const targetChannel = channels.find(c=>c.name===channel);
+    if (!targetChannel) return false;
+    if (targetChannel.type === "private" && !targetChannel.recipients.includes(user)) return false;
     return true;
-    // When it comes time to add dms add logic
+}
+
+function blockStatus(from, to) {
+    return 0;
 }
 
 function sanitize(str) {
@@ -122,7 +130,7 @@ function sendTypingUsers() {
 
 function channelsVisibleForUser(user) {
     return channels.filter(c=>{
-        if (c.type === "public" || c.type === "private" && c.members.includes(user.privateid)) return true;
+        if (c.type === "public" || c.type === "private" && c.recipients.includes(user.privateid)) return true;
         return false;
     }).map(c=>c.name)
 }
@@ -131,13 +139,15 @@ function processChatMessagesForPublicViewing(chatMsgs) {
     let msgs = [];
     if (!Array.isArray(chatMsgs)) chatMsgs = [chatMsgs]
     chatMsgs.forEach(chatMsg=>{
-        const { username, loggedIn, publicid } = users.find(u=>u.privateid === chatMsg.by)
-        msgs.push({
-            ...chatMsg,
-            by: publicid,
-            username: username,
-            isGuest: !loggedIn
-        })
+        if (!chatMsg.deleted) {
+            const { username, loggedIn, publicid } = users.find(u=>u.privateid === chatMsg.by)
+            msgs.push({
+                ...chatMsg,
+                by: publicid,
+                username: username,
+                isGuest: !loggedIn
+            })
+        }
     })
     return msgs.length === 1 ? msgs[0] : msgs
 }
@@ -148,6 +158,10 @@ async function sendForAllConnectedUsers(data, channel) {
         if (ws.readyState === 1)
             ws.send(JSON.stringify(data))
     })
+}
+
+function sendWsError(ws, msgid, error) {
+    ws.send(JSON.stringify({ msgid:msgid, type: "error", error: error }))
 }
 
 app.get('/', async (req,res)=>{
@@ -248,20 +262,30 @@ websocket.on("connection",(ws)=>{
     const userLastDisconnectTs = userInUsers.activity
                                  .filter(a=>a.type==="disconnect")
                                  .at(-1)
-                                 .ts
+                                 ?.ts
 
-    channelsVisibleForUser(ws.user).forEach(c=>{
-        const messageAfterLeaveTs = messages.filter(m=>m.channel===c)
-                                  .find(m=>m.timestamp > userLastDisconnectTs)
-                                  ?.timestamp
-        if (messageAfterLeaveTs && userInUsers.unreadChannels.findIndex(c2=>c2.channel === c) === -1) 
-            userInUsers.unreadChannels.push({
-                channel: c,
-                unreadSince: messageAfterLeaveTs
+    if (userLastDisconnectTs)
+        channelsVisibleForUser(ws.user).forEach(c=>{
+            const messageAfterLeaveTs = messages.filter(m=>m.channel===c)
+                                        .find(m=>m.timestamp > userLastDisconnectTs)
+                                        ?.timestamp
+            if (messageAfterLeaveTs && userInUsers.unreadChannels.findIndex(c2=>c2.channel === c) === -1) 
+                userInUsers.unreadChannels.push({
+                    channel: c,
+                    unreadSince: messageAfterLeaveTs
+                })
+        })
+
+    ws.send(JSON.stringify({ 
+        type:"channels", 
+        data:channelsVisibleForUser(ws.user)
+            .map(c=>{
+                return {
+                    name: c,
+                    unread: userInUsers.unreadChannels.find(u=>u.channel===c)?.unreadSince || 0
+                }
             })
-    })
-
-    ws.send(JSON.stringify({ type:"unreadDms", data:userInUsers.unreadChannels }))
+    }))
     ws.send(JSON.stringify({ type:"inbox", data:processChatMessagesForPublicViewing(messages.filter(msg=>userInUsers.inbox.includes(msg.id))) }))
 
     ws.onmessage = (ev) => {
@@ -276,12 +300,12 @@ websocket.on("connection",(ws)=>{
 
         const type = json.type;
         if (!genericRateLimits[type])
-            return ws.send(JSON.stringify({msgid:json.msgid, type:"error", error: "Unknown type" })); 
+            return sendWsError(ws, json.msgid, "Unknown type")
         const [ rateLimitAmount, rateLimitSecs ] = genericRateLimits[type].split('/')
 
         let rateLimitWs = rateLimits.find(r=> r.privateid === privateid && r.route === type)
         if (rateLimitWs?.count >= rateLimitAmount)
-            return ws.send(JSON.stringify({msgid:json.msgid, type:"error", error: "Too many requests" }));
+            return sendWsError(ws, json.msgid, "Too many requests")
         if (!rateLimitWs) {
             rateLimitWs = {
                 privateid: privateid,
@@ -296,9 +320,10 @@ websocket.on("connection",(ws)=>{
         rateLimitWs.count++;
 
         if (ev.data.length > 4096)
-            return ws.send(JSON.stringify({msgid:json.msgid, type:"error", error: "Too much data" }))
+            return sendWsError(ws, json.msgid, "Too much data")
 
-        onMessage(json,ws)
+        try { onMessage(json,ws) }
+        catch (e) { ws.send(JSON.stringify({ msgid:json.msgid,type:"servererror",error:e })) }
     }
     
     ws.onclose = (code) => {
@@ -315,13 +340,18 @@ websocket.on("connection",(ws)=>{
 
 function onMessage(msg,ws) {
     const { msgid } = msg;
-    const { username, isGuest, privateid, publicid } = ws.user;
+    const { privateid, publicid } = ws.user;
 
     const userpermissions = users
                       .find(u => u.privateid === privateid).roles
                       .map(name=>roles.find(role=>role.name === name))
                       .sort((a,b)=>a.level-b.level)
-                      ?.[0].permissions
+                      ?.[0]?.permissions
+                      || {
+                            "canXSS": false,
+                            "administrator": false
+                         }
+
     const userInUsers = users.find(u=>u.privateid === privateid)
 
     switch (msg.type) {
@@ -331,7 +361,7 @@ function onMessage(msg,ws) {
             const channel = channels.find(a=>a.name===newChannel)
 
             if (!userCanSeeChannel(channel, ws.user))
-                return ws.send(JSON.stringify({msgid:msgid, type: "error", error: "This channel does not exist"}));
+                return sendWsError(ws, msgid, "This channel does not exist")
 
             ws.channel = newChannel
 
@@ -351,19 +381,23 @@ function onMessage(msg,ws) {
         case "get_newer_messages": {
             const { lastMsgId, limit: numMessages = 100 } = msg.data;
             if (!lastMsgId || typeof(lastMsgId) !== "string")
-                return ws.send(JSON.stringify({ msgid:msgid, type: "error", error: "Please provide lastMsgId" }))
+                return sendWsError(ws, msgid, "Please provide lastMsgId")
             const type = msg.type.slice(4)
 
             if (numMessages > 100)
-                return ws.send(JSON.stringify({ msgid:msgid, type: "error", error: "Too many messages requested" }))
+                return sendWsError(ws, msgid, "Too many messages requested")
 
             if (!getChannelPermissions(ws.channel).canSeeMessageHistory && !userpermissions.administrator)
                 return ws.send(JSON.stringify({ msgid:msgid, type: type, data: [] }))
 
-            const index = messages.filter(m => m.channel === ws.channel).findIndex(m => m.id === lastMsgId);
+            const channelMessages = messages.filter(m => m.channel === ws.channel);
+            const targetIndex = channelMessages.findIndex(m => m.id === lastMsgId && !m.deleted)
+            if (targetIndex === -1)
+                return ws.send(JSON.stringify({ msgid:msgid, type: type, data: [] }));
+
             const foundMessages = type === "older_messages"
-                             ? messages.slice(Math.max(0, index - numMessages), index)
-                             : messages.slice(index + 1, index + 1 + numMessages);
+                             ? channelMessages.slice(Math.max(0, index - numMessages), targetIndex)
+                             : channelMessages.slice(targetIndex + 1, targetIndex + 1 + numMessages);
 
             ws.send(JSON.stringify({ 
                 msgid:msgid, 
@@ -374,13 +408,13 @@ function onMessage(msg,ws) {
         case "get_surrounding_messages": {
             const { messageId, limit = 25 } = msg.data;
             if (!messageId || typeof(messageId) !== "string")
-                return ws.send(JSON.stringify({ msgid:msgid, type: "error", error: "Please provide messageId" }))
+                return sendWsError(ws, msgid, "Please provide messageId")
 
             if (!getChannelPermissions(ws.channel).canSeeMessageHistory && !userpermissions.administrator)
                 return ws.send(JSON.stringify({ msgid:msgid, type: 'surrounding_messages', data: { messages: [], hasMoreNewer: false } }));
 
             const channelMessages = messages.filter(m => m.channel === ws.channel);
-            const targetIndex = channelMessages.findIndex(m => m.id === messageId);
+            const targetIndex = channelMessages.findIndex(m => m.id === messageId && !m.deleted);
 
             if (targetIndex === -1)
                 return ws.send(JSON.stringify({ msgid:msgid, type: 'surrounding_messages', data: { messages: [], hasMoreNewer: false } }));
@@ -389,7 +423,8 @@ function onMessage(msg,ws) {
             const combinedMessages = channelMessages.slice(Math.max(0, targetIndex - limit), endIndex);
 
             ws.send(JSON.stringify({
-                msgid:msgid, type: 'surrounding_messages',
+                msgid:msgid, 
+                type: 'surrounding_messages',
                 data: {
                     messages: processChatMessagesForPublicViewing(combinedMessages),
                     hasMoreNewer: endIndex < channelMessages.length
@@ -399,18 +434,18 @@ function onMessage(msg,ws) {
         case "get_message_by_id": {
             const { messageId } = msg.data;
             if (!messageId || typeof(messageId) !== "string")
-                return ws.send(JSON.stringify({ msgid:msgid, type: "error", error: "Please provide messageId" }))
+                return sendWsError(ws, msgid, "Please provide messageId")
 
             const targetMessage = messages.find(m => m.id === messageId);
             if (!targetMessage)
-                return ws.send(JSON.stringify({ msgid:msgid, type: "error", error: "Message not found with that id" }))
+                return sendWsError(ws, msgid, "Message not found with that id")
             if (targetMessage.deleted)
-                return ws.send(JSON.stringify({ msgid:msgid, type: "error", error: "That message is deleted" }))
+                return sendWsError(ws, msgid, "That message is deleted")
 
             const targetMessageChannel = targetMessage.channel;
             if (!userpermissions.administrator && 
                (!getChannelPermissions(targetMessageChannel).canSeeMessageHistory || !userCanSeeChannel(targetMessageChannel, ws.user)))
-                return ws.send(JSON.stringify({ msgid:msgid, type: "error", error: "You don't have permission to view this message" }))
+                return sendWsError(ws, msgid, "You don't have permission to view this message")
 
             ws.send(JSON.stringify({ msgid:msgid, type: "message_by_id", data: processChatMessagesForPublicViewing(targetMessage) }))
         } break;
@@ -420,10 +455,10 @@ function onMessage(msg,ws) {
             // This now simply updates a user's status rather than a bunch of other shite
             let { status } = msg.data;
             if (typeof(status) !== "number")
-                return ws.send(JSON.stringify({msgid:msgid, type: "error", error: "Must be a valid number"}))
+                return sendWsError(ws, msgid, "Must be a valid number")
             status = Math.round(status)
             if (status < 1 || status > 2)
-                return ws.send(JSON.stringify({msgid:msgid, type: "error", error: "Must be a valid number"}))
+                return sendWsError(ws, msgid, "Must be a valid number")
 
             const user = activeUsers[activeUsers.findIndex(u=>u.privateid === privateid)]
             user.status = status;
@@ -438,16 +473,16 @@ function onMessage(msg,ws) {
             const permissions = getChannelPermissions(channel);
 
             if (!permissions)
-                return ws.send(JSON.stringify({msgid:msgid, type: "error", error: "This channel does not exist"}));
+                return sendWsError(ws, msgid, "This channel does not exist")
 
             const maxMessageLength = permissions.maxMessageLength;
             const canSendMessages = permissions.canSendMessages
             const canSendMessagesWithAttachments = permissions.canSendMessagesWithAttachments;
 
             if (!canSendMessages && !userpermissions.administrator)
-                return ws.send(JSON.stringify({ msgid: msgid, type: "error", error: "You can't send messages in this channel"}));
+                return sendWsError(ws, msgid, "You can't send messages in this channel")
             if (attachment && !canSendMessagesWithAttachments && !userpermissions.administrator)
-                return ws.send(JSON.stringify({ msgid: msgid, type: "error", error: "You can't send messages with attachments in this channel"}));
+                return sendWsError(ws, msgid, "You can't send messages with attachments in this channel")
 
             if (maxMessageLength && message.length > maxMessageLength && !userpermissions.administrator)
                 message = message.substring(0,maxMessageLength);
@@ -495,11 +530,11 @@ function onMessage(msg,ws) {
         case "typing": {
             const { status } = msg.data;
             if (typeof(status) !== 'number')
-                return ws.send(JSON.stringify({msgid:msgid, type: "error", error: "Must be number"}));
+                return sendWsError(ws, msgid, "Must be number")
            
             const permissions = getChannelPermissions(ws.channel);
             if (!permissions.canSendMessages)
-                return ws.send(JSON.stringify({msgid:msgid, type: "error", error: "Can't send messages here"}));
+                return sendWsError(ws, msgid, "Can't send messages here")
 
             const index = typingUsers.findIndex(t=>t.publicid === publicid);
 
@@ -525,6 +560,86 @@ function onMessage(msg,ws) {
 
             sendTypingUsers();
             ws.send(JSON.stringify({msgid:msgid, type: "ok"}));
+        } break;
+        case "delete_message": {
+            const { id } = msg.data;
+            if (!id)
+                return sendWsError(ws, msgid, "Please provide the message id")
+
+            const msgIndex = messages.findIndex(msg=>msg.id === id)
+            if (msgIndex === -1)
+                return sendWsError(ws, msgid, "That message id not found")
+            const message = messages[msgIndex]
+            if (message.by !== privateid && !userpermissions.administrator)
+                return sendWsError(ws, msgid, "You are not allowed to delete this message")
+
+            message.deleted = 1;
+            message.deletedAt = Date.now()
+            message.deletedBy = privateid
+
+            const mentions = message.additionalDetails?.mentions
+            if (mentions)
+                mentions.forEach(m=>{
+                    const userInUsers = users.find(u=>u.publicid === m.publicid)
+                    if (userInUsers && userInUsers.inbox.includes(message.id)) {
+                        userInUsers.inbox.splice(userInUsers.inbox.findIndex(a=>a===message.id),1)
+                    }
+                })
+
+            ws.send(JSON.stringify({msgid:msgid, type: "ok"}));
+        } break;
+        case "change_username": {
+            const { newUsername } = msg.data;
+            if (typeof newUsername !== 'string' || newUsername.trim() === '' || !newUsername) 
+                return sendWsError(ws, msgid, "Please provide newUsername")
+            if (newUsername.length > 20)
+                return sendWsError(ws, msgid, "Username cannot be longer than 20 characters")
+
+            userInUsers.username = newUsername
+            activeUsers.find(u=>u.privateid===privateid).username = newUsername
+
+            sendForAllConnectedUsers({ type:"username_change",data: { id: publicid, newUsername: newUsername } })
+            ws.send(JSON.stringify({msgid:msgid,type:"ok"}))
+        } break;
+        case "create_dm": {
+            const { to } = msg.data;
+            if (!to)
+                return sendWsError(ws,msgid, "Please provide the recipient")
+
+            const targetUser = users.find(u=>u.publicid===to)?.privateid
+            if (!targetUser)
+                return sendWsError(ws,msgid, "Couldn't find this user")
+            if (blockStatus(privateid,targetUser))
+                return sendWsError(ws,msgid, "Cannot initiate a direct message where one user blocked the other")
+            if (channels.find(c=>
+                c.type==="private" && 
+                c.recipients.length === 2 &&
+                c.recipients.includes(privateid) &&
+                c.recipients.includes(targetUser)
+            ))
+                return sendWsError(ws,msgid, "This direct message already exists")
+
+            const newChannel = {
+                "name": uuid.v4(),
+                "type": "private",
+                "recipients": [privateid,targetUser],
+                "permissions": {
+                    "canReact": true,
+                    "canDelete": true,
+                    "canEdit": true,
+                    "canSeeMessageHistory": true,
+                    "canSendMessages": true,
+                    "maxMessageLength": 1000,
+                    "canSendMessagesWithAttachments": true,
+                    "slowmode": 0,
+                },
+                "createdAt": Date.now()
+            }
+
+            channels.push(newChannel)
+            
+            Array.from(websocket.clients).find(ws=>ws.user.privateid===targetUser)?.send(JSON.stringify({ type: "newChannel", data: newChannel.name }))
+            ws.send(JSON.stringify({msgid:msgid,type:"ok"}))
         } break;
         default:
             break;
