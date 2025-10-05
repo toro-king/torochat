@@ -1,5 +1,9 @@
 const express = require('express');
 const app = express();
+const registerRateLimit = require('express-rate-limit').rateLimit({
+    windowMs: 24 * 60 * 60 * 1000,
+    max: 25
+})
 
 const uuid = require('uuid');
 const fs = require('fs');
@@ -9,8 +13,11 @@ const WebSocket = require('ws');
 app.set('trust proxy', 1)
 
 const websocket = new WebSocket.Server({noServer: true})
+const port = 12345
 
 const base_dir = '/home/ubuntu/webserver/torochat/newserver/'
+
+console.log("Loading files")
 
 let users = [];
 try {
@@ -69,7 +76,13 @@ const genericRateLimits = {
     "typing": "15/3",
     "delete_message": "15/5",
     "change_username": "3/20",
-    "create_dm": "5/60"
+    "create_dm": "5/60",
+    "edit_message": "4/8",
+    "channels": "15/4",
+    "inbox":  "5/4",
+    "delete_inbox": "15/4",
+    "add_reaction": "15/4",
+    "remove_reaction": "15/4"
 }
 
 let activeUsers = [];
@@ -229,7 +242,7 @@ app.get('/', async (req,res)=>{
     })
 })
 
-app.get('/register',(req,res)=>{
+app.get('/register', registerRateLimit, (req,res)=>{
     const acuuid = uuid.v4()
     validGuestUuids.add(acuuid)
     res.cookie('guestAccountUuid',acuuid,{
@@ -238,6 +251,10 @@ app.get('/register',(req,res)=>{
         expires: new Date('9999-12-31')
     })
     res.status(200).json({"success":true,"uuid": acuuid})
+})
+
+app.get('/torochat/roles',(req,res)=>{
+    res.sendFile(base_dir + "roles.json")
 })
 
 websocket.on("connection",(ws)=>{
@@ -275,18 +292,6 @@ websocket.on("connection",(ws)=>{
                     unreadSince: messageAfterLeaveTs
                 })
         })
-
-    ws.send(JSON.stringify({ 
-        type:"channels", 
-        data:channelsVisibleForUser(ws.user)
-            .map(c=>{
-                return {
-                    name: c,
-                    unread: userInUsers.unreadChannels.find(u=>u.channel===c)?.unreadSince || 0
-                }
-            })
-    }))
-    ws.send(JSON.stringify({ type:"inbox", data:processChatMessagesForPublicViewing(messages.filter(msg=>userInUsers.inbox.includes(msg.id))) }))
 
     ws.onmessage = (ev) => {
         if (ev.data.length > 32767)
@@ -470,6 +475,9 @@ function onMessage(msg,ws) {
             let { message } = msg.data;
             const channel = ws.channel
 
+            if (typeof(message) !== 'string') 
+                return sendWsError(ws,msgid, "Message must be string")
+
             const permissions = getChannelPermissions(channel);
 
             if (!permissions)
@@ -586,6 +594,7 @@ function onMessage(msg,ws) {
                     }
                 })
 
+            sendForAllConnectedUsers({type:"delete_message",data:message.id},message.channel)
             ws.send(JSON.stringify({msgid:msgid, type: "ok"}));
         } break;
         case "change_username": {
@@ -599,6 +608,35 @@ function onMessage(msg,ws) {
             activeUsers.find(u=>u.privateid===privateid).username = newUsername
 
             sendForAllConnectedUsers({ type:"username_change",data: { id: publicid, newUsername: newUsername } })
+            ws.send(JSON.stringify({msgid:msgid,type:"ok"}))
+        } break;
+        case "edit_message": {
+            let { messageId, newMessage } = msg.data;
+            if (typeof(newMessage) !== 'string') 
+                return sendWsError(ws,msgid, "Message must be string")
+
+            const msgIndex = messages.findIndex(msg => msg.id === messageId);
+            if (msgIndex === -1)
+                return sendWsError(ws,msgid,"That message ID not found")
+
+            const msg = messages[msgIndex];
+            const permissions = getChannelPermissions(msg.channel)
+
+            if (privateid !== msg.by)
+                return sendWsError(ws,msgid, "You don't have permission to edit this message")
+            if (!permissions.canEdit)
+                return sendWsError(ws,msgid, "You can't edit messages in this channel")
+
+            if (newMessage.length > permissions.maxMessageLength && !userpermissions.administrator)
+                newMessage = newMessage.substring(0,permissions.maxMessageLength);
+
+            newMessage = msg.xss ? newMessage : sanitize(newMessage)
+            msg.message = newMessage
+            if (!msg.additionalDetails)
+                msg.additionalDetails = {};
+            msg.additionalDetails.edited = true
+
+            sendForAllConnectedUsers({type: "edit_message", data: { id: msg.id, newMessage: newMessage }}, msg.channel)
             ws.send(JSON.stringify({msgid:msgid,type:"ok"}))
         } break;
         case "create_dm": {
@@ -641,6 +679,46 @@ function onMessage(msg,ws) {
             Array.from(websocket.clients).find(ws=>ws.user.privateid===targetUser)?.send(JSON.stringify({ type: "newChannel", data: newChannel.name }))
             ws.send(JSON.stringify({msgid:msgid,type:"ok"}))
         } break;
+        case "channels": {
+            ws.send(JSON.stringify({ 
+                type:"channels", 
+                data:channelsVisibleForUser(ws.user)
+                    .map(c=>{
+                        return {
+                            name: c,
+                            unread: userInUsers.unreadChannels.find(u=>u.channel===c)?.unreadSince || 0
+                        }
+                    })
+            }))
+        } break;
+        case "inbox": {
+            const inboxset = new Set(userInUsers.inbox)
+            ws.send(JSON.stringify({
+                msgid:msgid,
+                type:"inbox",
+                data:processChatMessagesForPublicViewing(messages.filter(m=>inboxset.has(m.id)))
+            }))
+        } break;
+        case "delete_inbox": {
+            const { msgId } = msg.data;
+
+            if (msgId === "*") {
+                userInUsers.inbox = [];
+                return ws.send(JSON.stringify({msgid:msgid,type:"ok"}))
+            }
+
+            const inboxIndex = userInUsers.inbox.findIndex(m=>m===msgId);
+            if (inboxIndex === -1)
+                return sendWsError(ws,msgid,"This message not found in your inbox")
+
+            userInUsers.inbox.splice(inboxIndex,1)
+            ws.send(JSON.stringify({msgid:msgid,type:"ok"}))
+        } break;
+        case "add_reaction":
+        case "remove_reaction": {
+            const { messageId, emoji } = msg.data;
+            
+        } break;
         default:
             break;
     }
@@ -670,6 +748,8 @@ boi.forEach(thing=>{
     })
 })
 
-app.listen(12345)
+app.listen(port,()=>{
+    console.log("Done, listening on "+port)
+})
 
 setInterval(sendUsersOnline,10000)
