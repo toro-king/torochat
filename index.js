@@ -5,6 +5,8 @@ const registerRateLimit = require('express-rate-limit').rateLimit({
     max: 25
 })
 
+const emojiRegex = require('emoji-regex')()
+
 const uuid = require('uuid');
 const fs = require('fs');
 
@@ -72,17 +74,18 @@ const genericRateLimits = {
     "get_surrounding_messages": "15/4",
     "get_message_by_id": "15/4",
     "update_status": "3/15",
-    "send_message": "10/5",
-    "typing": "15/3",
+    "send_message": "6/4",
+    "typing": "30/6",
     "delete_message": "15/5",
     "change_username": "3/20",
     "create_dm": "5/60",
     "edit_message": "4/8",
-    "channels": "15/4",
+    "channels": "10/4",
     "inbox":  "5/4",
     "delete_inbox": "15/4",
-    "add_reaction": "15/4",
-    "remove_reaction": "15/4"
+    "add_reaction": "10/4",
+    "remove_reaction": "10/4",
+    "query_user": "30/4"
 }
 
 let activeUsers = [];
@@ -95,7 +98,7 @@ function getChannelPermissions(chan) {
 function userCanSeeChannel(channel, user) {
     const targetChannel = channels.find(c=>c.name===channel);
     if (!targetChannel) return false;
-    if (targetChannel.type === "private" && !targetChannel.recipients.includes(user)) return false;
+    if (targetChannel.type === "private" && !targetChannel.recipients.includes(user.privateid)) return false;
     return true;
 }
 
@@ -149,26 +152,50 @@ function channelsVisibleForUser(user) {
 }
 
 function processChatMessagesForPublicViewing(chatMsgs) {
-    let msgs = [];
-    if (!Array.isArray(chatMsgs)) chatMsgs = [chatMsgs]
-    chatMsgs.forEach(chatMsg=>{
-        if (!chatMsg.deleted) {
-            const { username, loggedIn, publicid } = users.find(u=>u.privateid === chatMsg.by)
-            msgs.push({
+    if (!Array.isArray(chatMsgs)) chatMsgs = [chatMsgs];
+    const msgs = chatMsgs
+        .filter(chatMsg => !chatMsg.deleted)
+        .map(chatMsg => {
+            const { username, isGuest } = getUserDetailsByPubId([chatMsg.by])[0];
+            if (chatMsg.additionalDetails.emojiReactions)
+                var emojiReactionsPub = Object.fromEntries(
+                        Object.entries(chatMsg.additionalDetails.emojiReactions).map(emoji=>{
+                            return [emoji[0],getUserDetailsByPubId(emoji[1].map(obj=>obj.by))]
+                        }
+                    )
+                )
+            return {
                 ...chatMsg,
-                by: publicid,
                 username: username,
-                isGuest: !loggedIn
-            })
-        }
+                isGuest: isGuest,
+                additionalDetails: {
+                    ...chatMsg.additionalDetails,
+                    emojiReactions: emojiReactionsPub
+                }
+            };
+        });
+
+    return msgs.length === 1 ? msgs[0] : msgs;
+}
+
+function getUserDetailsByPubId(usrs) {
+    if (!Array.isArray(usrs)) usrs = [usrs]
+    const usersToSend = usrs.map(usr=>{
+        const targetUsr = users.find(u=>u.publicid === usr)
+        if (targetUsr)
+            return {
+                username: targetUsr.username,
+                isGuest: targetUsr.isGuest
+            }
+        return null
     })
-    return msgs.length === 1 ? msgs[0] : msgs
+    return usersToSend
 }
 
 async function sendForAllConnectedUsers(data, channel) {
     const clients = channel ? Array.from(websocket.clients).filter(a=>a.channel === channel) : Array.from(websocket.clients);
     clients.forEach(ws=>{
-        if (ws.readyState === 1)
+        if (ws.readyState === WebSocket.OPEN)
             ws.send(JSON.stringify(data))
     })
 }
@@ -192,10 +219,10 @@ app.get('/', async (req,res)=>{
 
     if (guestAccountUuidCookie) {
         const guestAccount = users.find(a=>a.privateid === guestAccountUuidCookie)
-        if (guestAccount) user = { "loggedIn": false, "username": guestAccount.username, "privateid": guestAccount.privateid }
+        if (guestAccount) user = { "isGuest": true, "username": guestAccount.username, "privateid": guestAccount.privateid }
         else {
             if (!validGuestUuids.has(guestAccountUuidCookie)) return res.status(403).json({"success": false, "error": "This guest account uuid doesn't exist. Please clear your cookies"})
-            user = { "loggedIn": false, "username": "guest" + String(Math.floor(Math.random()*100000)).padEnd(5,"0"), "privateid": uuid.v4() }
+            user = { "isGuest": true, "username": "guest" + String(Math.floor(Math.random()*100000)).padEnd(5,"0"), "privateid": uuid.v4() }
         }
     }
 
@@ -217,7 +244,7 @@ app.get('/', async (req,res)=>{
     }
 
     let userInUsers = users.find(u=>u.privateid === user.privateid)
-    if (userInUsers && userInUsers.loggedIn && user.username !== userInUsers.username) userInUsers.username = user.username
+    if (userInUsers && !userInUsers.isGuest && user.username !== userInUsers.username) userInUsers.username = user.username
     if (!userInUsers) {
         userInUsers = {
             ...user,
@@ -284,8 +311,8 @@ websocket.on("connection",(ws)=>{
     if (userLastDisconnectTs)
         channelsVisibleForUser(ws.user).forEach(c=>{
             const messageAfterLeaveTs = messages.filter(m=>m.channel===c)
-                                        .find(m=>m.timestamp > userLastDisconnectTs)
-                                        ?.timestamp
+                                        .find(m=>m.ts > userLastDisconnectTs)
+                                        ?.ts
             if (messageAfterLeaveTs && userInUsers.unreadChannels.findIndex(c2=>c2.channel === c) === -1) 
                 userInUsers.unreadChannels.push({
                     channel: c,
@@ -350,8 +377,9 @@ function onMessage(msg,ws) {
     const userpermissions = users
                       .find(u => u.privateid === privateid).roles
                       .map(name=>roles.find(role=>role.name === name))
-                      .sort((a,b)=>a.level-b.level)
-                      ?.[0]?.permissions
+                      .filter(Boolean)
+                      .sort((a,b)=>b.level-a.level)
+                      [0]?.permissions
                       || {
                             "canXSS": false,
                             "administrator": false
@@ -375,7 +403,7 @@ function onMessage(msg,ws) {
                 userInUsers.unreadChannels.splice(uindex, 1)
 
             const permissions = getChannelPermissions(newChannel);
-            ws.send(JSON.stringify({ msgid: msgid, type: "channel_permissions", data: permissions }))
+            ws.send(JSON.stringify({ type: "channel_permissions", data: permissions }))
 
             let historyToSend = [];
             if (permissions.canSeeMessageHistory === true) 
@@ -401,7 +429,7 @@ function onMessage(msg,ws) {
                 return ws.send(JSON.stringify({ msgid:msgid, type: type, data: [] }));
 
             const foundMessages = type === "older_messages"
-                             ? channelMessages.slice(Math.max(0, index - numMessages), targetIndex)
+                             ? channelMessages.slice(Math.max(0, targetIndex - numMessages), targetIndex)
                              : channelMessages.slice(targetIndex + 1, targetIndex + 1 + numMessages);
 
             ws.send(JSON.stringify({ 
@@ -471,7 +499,7 @@ function onMessage(msg,ws) {
             ws.send(JSON.stringify({msgid:msgid, type: "ok"}))
         } break;
         case "send_message": {
-            const { attachment, xss, additionalDetails} = msg.data;
+            const { attachment, xss, additionalDetails: {}} = msg.data;
             let { message } = msg.data;
             const channel = ws.channel
 
@@ -492,19 +520,23 @@ function onMessage(msg,ws) {
             if (attachment && !canSendMessagesWithAttachments && !userpermissions.administrator)
                 return sendWsError(ws, msgid, "You can't send messages with attachments in this channel")
 
+            // Slow mode code here
+
             if (maxMessageLength && message.length > maxMessageLength && !userpermissions.administrator)
                 message = message.substring(0,maxMessageLength);
 
-            const sanitizedMessage = xss && userpermissions.canXSS ? message : sanitize(message);
+            const canXSS = xss && userpermissions.canXSS
+            const sanitizedMessage = canXSS ? message : sanitize(message);
 
             const chatMsg = {
                 id: uuid.v4(),
-                by: privateid,
+                by: publicid,
                 message: sanitizedMessage,
                 attachment: attachment,
                 additionalDetails: additionalDetails,
-                timestamp: Date.now(),
-                channel: channel
+                ts: Date.now(),
+                channel: channel,
+                xss: canXSS
             }
 
             messages.push(chatMsg)
@@ -521,7 +553,7 @@ function onMessage(msg,ws) {
                 }
             })
 
-            const mentions = chatMsg.additionalDetails?.mentions
+            const mentions = chatMsg.additionalDetails.mentions
             if (mentions)
                 mentions.forEach(m=>{
                     const userInUsers = users.find(u=>u.publicid === m.publicid)
@@ -574,18 +606,18 @@ function onMessage(msg,ws) {
             if (!id)
                 return sendWsError(ws, msgid, "Please provide the message id")
 
-            const msgIndex = messages.findIndex(msg=>msg.id === id)
+            const msgIndex = messages.findIndex(msg=>msg.id === id && msg.channel === ws.channel)
             if (msgIndex === -1)
                 return sendWsError(ws, msgid, "That message id not found")
             const message = messages[msgIndex]
-            if (message.by !== privateid && !userpermissions.administrator)
+            if (message.by !== publicid && !userpermissions.administrator)
                 return sendWsError(ws, msgid, "You are not allowed to delete this message")
 
             message.deleted = 1;
             message.deletedAt = Date.now()
-            message.deletedBy = privateid
+            message.deletedBy = publicid
 
-            const mentions = message.additionalDetails?.mentions
+            const mentions = message.additionalDetails.mentions
             if (mentions)
                 mentions.forEach(m=>{
                     const userInUsers = users.find(u=>u.publicid === m.publicid)
@@ -615,14 +647,14 @@ function onMessage(msg,ws) {
             if (typeof(newMessage) !== 'string') 
                 return sendWsError(ws,msgid, "Message must be string")
 
-            const msgIndex = messages.findIndex(msg => msg.id === messageId);
+            const msgIndex = messages.findIndex(msg => msg.id === messageId && msg.channel === ws.channel);
             if (msgIndex === -1)
                 return sendWsError(ws,msgid,"That message ID not found")
 
             const msg = messages[msgIndex];
             const permissions = getChannelPermissions(msg.channel)
 
-            if (privateid !== msg.by)
+            if (publicid !== msg.by)
                 return sendWsError(ws,msgid, "You don't have permission to edit this message")
             if (!permissions.canEdit)
                 return sendWsError(ws,msgid, "You can't edit messages in this channel")
@@ -717,7 +749,71 @@ function onMessage(msg,ws) {
         case "add_reaction":
         case "remove_reaction": {
             const { messageId, emoji } = msg.data;
-            
+            const type = msg.type.split('_')[0]
+
+            if (typeof(emoji) !== "string" || !(()=>{
+                const match = [...emoji.matchAll(emojiRegex)]
+                return match.length === 1 && match[0][0] === emoji;
+            })())
+                return sendWsError(ws,msgid,"Must be emoji")
+
+            const msg = messages.find(m => m.id === messageId && m.channel === ws.channel);
+            if (!msg)
+                return sendWsError(ws,msgid,"Can't find this messasge")
+
+            if (blockStatus(privateid,users.find(u=>u.privateid===msg.by).privateid))
+                return sendWsError(ws,msgid, "Cannot initiate a emoji reaction where one user blocked the other")
+
+            if (!msg.additionalDetails) msg.additionalDetails = {};
+            if (!msg.additionalDetails.emojiReactions) msg.additionalDetails.emojiReactions = {};
+
+            const reactions = msg.additionalDetails.emojiReactions
+
+            if (type === "add") {
+                if (Object.keys(reactions).length >= 10)
+                    return sendWsError(ws,msgid,"This message already has the maximum amount of emoji reactions")
+
+                if (!reactions[emoji]) reactions[emoji] = [];
+                var targetReaction = reactions[emoji];
+
+                const existingUser = targetReaction.find(u=>u.by===publicid)
+                if (existingUser)
+                    return sendWsError(ws,msgid,"You already reacted to this message with that emoji")
+
+                targetReaction.push({
+                    by: publicid,
+                    at: Date.now()
+                })
+            } else if (type === "remove") {
+                var targetReaction = reactions[emoji];
+                if (!targetReaction)
+                    return sendWsError(ws,msgid,"Emoji reaction not found")
+
+                const targetUser = targetReaction.findIndex(u=>u.by===publicid)
+                if (targetUser === -1)
+                    return sendWsError(ws,msgid,"You have not reacted with this emoji")
+
+                targetReaction.splice(targetUser,1)
+                if (targetReaction.length === 0) delete reactions[emoji];
+            }
+    
+            sendForAllConnectedUsers({type:"emoji_update",data:{
+                id:msg.id,
+                emoji:emoji,
+                reactionData: getUserDetailsByPubId(targetReaction.map(obj=>obj.by))
+            }},msg.channel)
+            ws.send(JSON.stringify({msgid:msgid,type:"ok"}))
+        } break;
+        case "query_user": {
+            const { id } = msg.data;
+            const targetUser = getUserDetailsByPubId([id])[0]
+            if (!targetUser)
+                return sendWsError(ws,msgid,"User not found")
+            ws.send(JSON.stringify({
+                msgid:msgid,
+                type:"query_user",
+                data: targetUser
+            }))
         } break;
         default:
             break;
